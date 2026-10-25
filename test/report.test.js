@@ -4,7 +4,7 @@ import { MARKER, commentBody, commitMessage, formatBytes, knownBlobs, report } f
 
 const sha = (char) => char.repeat(40);
 
-const empty = { compressed: [], optimized: [], failed: [], leftOver: [], limitMessage: null, commit: null, commitNote: null };
+const empty = { sent: 0, compressed: [], optimized: [], skipped: [], failed: [], leftOver: [], limitMessage: null, commit: null, commitNote: null };
 
 test('formatBytes', () => {
     assert.equal(formatBytes(512), '512 B');
@@ -42,6 +42,7 @@ test('the report lists what was saved, what was already small, what failed and w
             { path: 'img/c.jpg', before: 10240, after: 7680 },
         ],
         optimized: [{ path: 'img/d.webp' }],
+        skipped: [{ path: 'img/h.png', message: 'It is stored in Git LFS, and the action reads only files kept in Git itself.' }],
         failed: [{ path: 'img/e.png', message: 'Iminify could not compress it.' }],
         leftOver: ['img/f.png', 'img/g.png'],
         limitMessage: "You've used your 40 images for today. Come back in about 3 hours.",
@@ -52,17 +53,31 @@ test('the report lists what was saved, what was already small, what failed and w
     assert.ok(text.includes('| `img/a\\|b.png` | 10.0 KB | 2.5 KB | 75.0% |'), 'a pipe in a path is escaped in the table');
     assert.ok(text.includes('| `img/c.jpg` | 10.0 KB | 7.5 KB | 25.0% |'));
     assert.ok(text.includes('Already as small as Iminify can make them: `img/d.webp`.'));
-    assert.ok(text.includes('- `img/e.png`: Iminify could not compress it.'));
+    assert.ok(text.includes('Left alone:\n- `img/h.png`: It is stored in Git LFS'));
+    assert.ok(text.includes('Not compressed, and sent again on the next push:\n- `img/e.png`: Iminify could not compress it.'));
     assert.ok(text.includes('ran out before 2 images (`img/f.png`, `img/g.png`)'));
     assert.ok(text.includes("> You've used your 40 images for today."));
 });
 
 test('the report says so when nothing got smaller, and why nothing was committed', () => {
-    assert.ok(report({ ...empty, optimized: [{ path: 'a.png' }] }).startsWith('**Iminify found nothing it could make smaller.**'));
+    assert.ok(report({ ...empty, sent: 1, optimized: [{ path: 'a.png' }] }).startsWith('**Iminify found nothing it could make smaller.**'));
+    assert.ok(report({ ...empty, sent: 1, skipped: [{ path: 'a.png', message: 'Iminify returned it as jpg, so it was left as it is.' }] }).startsWith('**Iminify found nothing it could make smaller.**'));
+    assert.ok(report({ ...empty, skipped: [{ path: 'a.png', message: 'Its bytes are not a PNG image.' }] }).startsWith('**Nothing was sent to Iminify.**'));
 
     const note = report({ ...empty, compressed: [{ path: 'a.png', before: 2048, after: 1024 }], commitNote: 'The commit input is off, so nothing was committed.' });
 
     assert.ok(note.startsWith('**Iminify compressed 1 image and saved 1.0 KB (50.0%).** The commit input is off'));
+});
+
+test('a huge run lists the first hundred of each and counts the rest', () => {
+    const many = (count) => Array.from({ length: count }, (_, i) => ({ path: `img/${i}.png`, before: 2048, after: 1024, message: 'No.' }));
+    const text = report({ ...empty, sent: 250, compressed: many(130), optimized: many(101), failed: many(100) });
+
+    assert.equal(text.split('\n').filter((line) => line.startsWith('| `img/')).length, 100);
+    assert.ok(text.includes('...and 30 more.'));
+    assert.ok(text.includes('...and 1 more.'));
+    assert.ok(!text.includes('`img/100.png`, '), 'the 101st already-small image is only counted');
+    assert.equal(text.split('\n').filter((line) => line.startsWith('- `img/')).length, 100);
 });
 
 test('the comment carries the marker', () => {

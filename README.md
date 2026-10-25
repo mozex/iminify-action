@@ -3,7 +3,7 @@
 A GitHub Action that compresses the images a pull request adds or changes with [Iminify](https://www.iminify.com), commits the smaller files to the pull request's branch, and leaves a comment with what each one saved.
 
 ```text
-Iminify compressed 2 images and saved 1.31 MB (71.8%). The smaller files are in 4f0c2e1.
+Iminify compressed 2 images and saved 1.32 MB (72.2%). The smaller files are in 4f0c2e1.
 
 | Image                  | Before   | After    | Saved |
 | ---------------------- | -------- | -------- | ----- |
@@ -44,11 +44,12 @@ The action reads the files through GitHub's API, so the job needs no checkout st
 
 ## What it does
 
-- It looks at the PNG, JPG, WebP and GIF files the pull request adds or changes. HEIC and TIFF files are left alone because Iminify always returns them in another format, and a new extension would break every reference to the file.
+- It looks at the PNG, JPG, WebP and GIF files the pull request adds or changes. A file only moved or copied, with the same bytes, isn't sent again. HEIC and TIFF files are left alone because Iminify always returns them in another format, and a new extension would break every reference to the file.
+- It checks each file's first bytes before sending it. A file whose bytes don't match its extension (a PNG named `.jpg`) is left alone, and so is a file stored in Git LFS: the action reads only what's in Git itself.
 - It sends each one to Iminify with alt text off and its format kept, at the level you choose.
-- Files that came back smaller go into one commit on the pull request's branch. GitHub signs it, and since it's made with the workflow's own token, it doesn't start another workflow run.
+- Files that came back smaller go into one commit on the pull request's branch. It's made with the workflow's own token, so it doesn't start another workflow run.
 - The comment lists every file with its size before and after. The action updates the same comment on each push instead of adding a new one.
-- It never sends the same bytes twice. Its own commits name the files they wrote, and the comment remembers the images Iminify couldn't make smaller, so a later push only sends what's new.
+- A later push sends only what's new. The action's commits name the files they wrote, and its comment remembers the images Iminify couldn't make smaller and the files it left alone. An image that failed is sent again. With `comment: false`, so is an image Iminify couldn't make smaller, since only the comment remembers it, and with `commit` and `comment` both off, every image is sent again on every push.
 
 ## Inputs
 
@@ -59,8 +60,8 @@ The action reads the files through GitHub's API, so the job needs no checkout st
 | `level` | `smart` | `smart` finds the lowest quality that still looks like the original, `ultra` goes a little further, and `lossless` changes no pixel. |
 | `keep-metadata` | `false` | Keep the EXIF metadata (camera, date, location). By default it's stripped. |
 | `commit` | `true` | Commit the smaller files. With `false`, the action only reports what it would save. |
-| `comment` | `true` | Write the savings in a pull request comment. |
-| `ignore` | | Paths to leave alone, one pattern per line. A pattern without a slash matches a file name in any folder (`*.gif`), one with a slash starts at the repository root (`tests/fixtures/`), and `**` crosses folders. |
+| `comment` | `true` | Write the savings in a pull request comment. With `false`, images Iminify couldn't make smaller are sent again on every push. |
+| `ignore` | | Paths to leave alone, one pattern per line, read like `.gitignore` patterns without `!` or `[...]`. A pattern with no slash, or only one at its end, matches at any depth (`*.gif`, `fixtures`), one with a slash before its end starts at the repository root (`tests/fixtures`), a pattern that names a folder covers everything in it, and `**` crosses folders. |
 
 ## Outputs
 
@@ -84,7 +85,7 @@ Don't switch the workflow to `pull_request_target` to get around this. That even
 
 ## Required status checks
 
-A commit made with the workflow's own token doesn't start workflow runs, so required checks on the new head commit wait until the next push. If that gets in the way, pass a personal access token or a GitHub App token as `github-token`. Its commit starts a new run, and that run finds nothing new to send.
+A commit made with the workflow's own token doesn't start workflow runs, so required checks on the new head commit wait until the next push. If that gets in the way, pass a personal access token or a GitHub App token as `github-token`. Its commit starts a new run, which doesn't send the files the action just wrote.
 
 ## License
 

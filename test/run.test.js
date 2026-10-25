@@ -42,25 +42,57 @@ const kit = () => {
     };
 };
 
+/** Bytes that start the way a real file of that format does. */
+const image = (format, size, fill) => {
+    const head = { png: Buffer.from('89504e470d0a1a0a', 'hex'), jpg: Buffer.from('ffd8ffe0', 'hex'), webp: Buffer.from('RIFF\0\0\0\0WEBP', 'latin1') }[format];
+
+    return Buffer.concat([head, Buffer.alloc(size - head.length, fill)]);
+};
+
 /** The original bytes in the repository, and what Iminify makes of each. */
 const BLOBS = {
-    a1: Buffer.alloc(4000, 'a'),
-    b2: Buffer.alloc(3000, 'b'),
-    c3: Buffer.alloc(2000, 'c'),
-    d4: Buffer.alloc(1000, 'd'),
+    a1: image('png', 4000, 'a'),
+    b2: image('jpg', 3000, 'b'),
+    c3: image('webp', 2000, 'c'),
+    e5: image('jpg', 1500, 'e'),
+    f0: Buffer.from('version https://git-lfs.github.com/spec/v1\noid sha256:4d7a\nsize 12345\n'),
 };
 const SMALLER = { 'hero.png': Buffer.alloc(1000, 'A'), 'photo.jpg': Buffer.alloc(2000, 'B'), 'logo.webp': Buffer.alloc(500, 'C') };
 
-const fakeGitHub = ({ files, commits = [], comments = [], head = HEAD, commitError = null }) => {
-    const calls = { blobs: [], created: [], commits: [], comments: [] };
+const fakeGitHub = ({ files, commits = [], comments = [], head = HEAD, base = {}, blobError = null, commitError = null }) => {
+    const calls = { preflights: 0, created: [], folders: [], mergeBases: [], commits: [], comments: [] };
     const github = {
-        pull: async () => ({ head: { sha: head, ref: 'feature' } }),
+        pull: async () => ({ head: { sha: head, ref: 'feature' }, base: { sha: 'base-sha' } }),
         pullFiles: async () => files,
         pullCommits: async () => commits,
         comments: async () => comments,
-        blob: async (sha) => BLOBS[sha],
+        blob: async (sha) => {
+            if (blobError?.reading) {
+                throw blobError;
+            }
+
+            return BLOBS[sha];
+        },
+        mergeBase: async (baseSha, headSha) => {
+            calls.mergeBases.push([baseSha, headSha]);
+
+            return 'merge-base-sha';
+        },
+        folderShas: async (folder, ref) => {
+            calls.folders.push([folder, ref]);
+
+            return new Map(Object.entries(base).filter(([path]) => (path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '') === folder));
+        },
         createBlob: async (bytes) => {
-            calls.created.push(bytes);
+            if (blobError && !blobError.reading) {
+                throw blobError;
+            }
+
+            if (0 === bytes.length) {
+                calls.preflights++;
+            } else {
+                calls.created.push(bytes);
+            }
 
             return blobSha(bytes);
         },
@@ -144,6 +176,7 @@ test('it compresses the new images, commits the smaller ones and reports the sav
         { name: 'logo.webp', level: 'ultra', keepMetadata: true, size: 2000 },
     ]);
 
+    assert.equal(calls.preflights, 1, 'the token\'s write access is checked once, first');
     assert.deepEqual(calls.created, [SMALLER['hero.png'], SMALLER['photo.jpg']]);
     assert.equal(calls.commits.length, 1);
     assert.equal(calls.commits[0].branch, 'feature');
@@ -176,8 +209,9 @@ test('a later push sends only what the action has not handled, and updates its c
     const written = blobSha(SMALLER['hero.png']);
     const commits = [{ commit: { message: commitMessage([{ path: 'public/hero.png', before: 4000, after: 1000, outputSha: written }]) } }];
     const comments = [
-        { id: 90, body: 'An unrelated comment' },
-        { id: 91, body: `${MARKER}\nEarlier report\n\n<!-- iminify-action-blobs: c3 -->\n` },
+        { id: 89, user: { type: 'User' }, author_association: 'NONE', body: `${MARKER}\nA stranger's copy\n\n<!-- iminify-action-blobs: b2 -->\n` },
+        { id: 90, user: { type: 'User' }, author_association: 'OWNER', body: 'An unrelated comment' },
+        { id: 91, user: { type: 'Bot' }, author_association: 'NONE', body: `${MARKER}\nEarlier report\n\n<!-- iminify-action-blobs: c3 -->\n` },
     ];
     const files = [
         { filename: 'public/hero.png', status: 'added', sha: written },
@@ -189,9 +223,60 @@ test('a later push sends only what the action has not handled, and updates its c
 
     await run({ env: env(), event: event(), kit: kit(), makeGitHub: () => github, makeIminify: iminify.make });
 
-    assert.deepEqual(iminify.calls.uploads.map((upload) => upload.name), ['photo.jpg']);
+    assert.deepEqual(iminify.calls.uploads.map((upload) => upload.name), ['photo.jpg'], 'a stranger\'s comment with the marker is not believed');
     assert.equal(calls.comments[0].update, 91);
-    assert.deepEqual([...knownBlobs({ comment: calls.comments[0].body })].sort(), [blobSha(SMALLER['photo.jpg']), 'c3'].sort());
+    assert.deepEqual(
+        [...knownBlobs({ comment: calls.comments[0].body })].sort(),
+        [written, blobSha(SMALLER['photo.jpg']), 'c3'].sort(),
+        'the comment also keeps what only a commit trailer remembered, in case that commit is squashed away',
+    );
+});
+
+test('a file moved or copied without a change is not sent again, an edited one is', async () => {
+    const files = [
+        { filename: 'assets/hero.png', status: 'renamed', previous_filename: 'public/hero.png', sha: 'a1' },
+        { filename: 'assets/photo.jpg', status: 'renamed', previous_filename: 'public/photo.jpg', sha: 'b2' },
+        { filename: 'assets/logo.webp', status: 'copied', previous_filename: 'public/logo.webp', sha: 'c3' },
+        { filename: 'assets/top.png', status: 'renamed', previous_filename: 'top.png', sha: 'a1' },
+    ];
+    const { github, calls } = fakeGitHub({ files, base: { 'public/hero.png': 'a1', 'public/photo.jpg': 'an-older-photo', 'public/logo.webp': 'c3', 'top.png': 'a1' } });
+    const iminify = fakeIminify({ 'photo.jpg': 'completed' });
+
+    await run({ env: env(), event: event(), kit: kit(), makeGitHub: () => github, makeIminify: iminify.make });
+
+    assert.deepEqual(iminify.calls.uploads.map((upload) => upload.name), ['photo.jpg']);
+    assert.deepEqual(calls.mergeBases, [['base-sha', HEAD]], 'compared where the branch left the base, as GitHub lists the files');
+    assert.deepEqual(calls.folders, [['public', 'merge-base-sha'], ['', 'merge-base-sha']], 'one listing per folder, the root as an empty path');
+});
+
+test('without a moved file, no merge base or folder is read', async () => {
+    const { github, calls } = fakeGitHub({ files: FILES });
+
+    await run({ env: env(), event: event(), kit: kit(), makeGitHub: () => github, makeIminify: fakeIminify({ 'hero.png': 'completed', 'photo.jpg': 'completed', 'logo.webp': 'completed' }).make });
+
+    assert.deepEqual(calls.mergeBases, []);
+    assert.deepEqual(calls.folders, []);
+});
+
+test('a Git LFS pointer and a file whose bytes contradict its extension are left alone and remembered', async () => {
+    const files = [
+        { filename: 'public/big.png', status: 'added', sha: 'f0' },
+        { filename: 'public/fake.png', status: 'added', sha: 'e5' },
+    ];
+    const { github, calls } = fakeGitHub({ files });
+    const iminify = fakeIminify({});
+    const k = kit();
+
+    const result = await run({ env: env(), event: event(), kit: k, makeGitHub: () => github, makeIminify: iminify.make });
+
+    assert.deepEqual(iminify.calls.uploads, [], 'nothing is spent on them');
+    assert.deepEqual(result.skipped.map((file) => file.message), [
+        'It is stored in Git LFS, and the action reads only files kept in Git itself.',
+        'Its bytes are a JPG, not what its .png extension says.',
+    ]);
+    assert.ok(calls.comments[0].body.includes('Left alone:\n- `public/big.png`: It is stored in Git LFS'));
+    assert.deepEqual([...knownBlobs({ comment: calls.comments[0].body })].sort(), ['e5', 'f0']);
+    assert.equal(k.log.warning.length, 2);
 });
 
 test('with nothing new it calls Iminify for nothing and leaves the comment alone', async () => {
@@ -236,8 +321,8 @@ test('one image that fails is reported while the rest go on', async () => {
     assert.deepEqual(result.failed, [
         { path: 'public/photo.jpg', message: 'The file is too large for your plan.' },
         { path: 'public/hero.png', message: 'Iminify could not compress it.' },
-        { path: 'public/logo.webp', message: 'Iminify returned it as png, so it was left as it is.' },
     ]);
+    assert.deepEqual(result.skipped, [{ path: 'public/logo.webp', message: 'Iminify returned it as png, so it was left as it is.', inputSha: 'c3' }]);
     assert.deepEqual(result.compressed, [], 'a file in another format is never written under the old name');
     assert.equal(k.log.warning.length, 3);
 });
@@ -263,7 +348,46 @@ test('a branch that moved during the run gets no commit, and the images are not 
     assert.equal(k.log.outputs.commit, '');
 });
 
-test('a token that cannot push fails the step after the comment is written', async () => {
+test('a token that cannot write stops the run before anything is sent to Iminify', async () => {
+    const { github, calls } = fakeGitHub({ files: FILES, blobError: new GitHubError('Resource not accessible by integration', 403) });
+    const iminify = fakeIminify({ 'hero.png': 'completed' });
+
+    await assert.rejects(
+        run({ env: env(), event: event(), kit: kit(), makeGitHub: () => github, makeIminify: iminify.make }),
+        /GitHub refused to store a file \(Resource not accessible by integration\)\. Give the workflow the contents: write permission\./,
+    );
+    assert.deepEqual(iminify.calls.uploads, []);
+    assert.deepEqual(calls.comments, []);
+});
+
+test('GitHub refusing the token while reading stops the run, and only a refusal reads as a permission problem', async () => {
+    const refused = Object.assign(new GitHubError('Resource not accessible by integration', 403), { reading: true });
+    const { github, calls } = fakeGitHub({ files: FILES, blobError: refused });
+    const iminify = fakeIminify({ 'hero.png': 'completed', 'photo.jpg': 'completed', 'logo.webp': 'completed' });
+
+    await assert.rejects(run({ env: env({ commit: 'false' }), event: event(), kit: kit(), makeGitHub: () => github, makeIminify: iminify.make }), /Resource not accessible by integration/);
+    assert.deepEqual(iminify.calls.uploads, []);
+    assert.deepEqual(calls.comments, []);
+
+    const down = fakeGitHub({ files: FILES, blobError: new GitHubError('Server Error', 502) });
+
+    await assert.rejects(run({ env: env(), event: event(), kit: kit(), makeGitHub: () => down.github, makeIminify: iminify.make }), (error) => {
+        assert.equal(error.message, 'Server Error');
+
+        return true;
+    });
+});
+
+test('with commit and comment both off it says every push sends them again', async () => {
+    const { github } = fakeGitHub({ files: FILES });
+    const k = kit();
+
+    await run({ env: env({ commit: 'false', comment: 'false' }), event: event(), kit: k, makeGitHub: () => github, makeIminify: fakeIminify({ 'hero.png': 'completed', 'photo.jpg': 'completed', 'logo.webp': 'completed' }).make });
+
+    assert.deepEqual(k.log.notice, ['With commit and comment both off, nothing remembers these images, so every push sends them again.']);
+});
+
+test('a refused commit fails the step after the comment is written', async () => {
     const { github, calls } = fakeGitHub({ files: FILES, commitError: new GitHubError('Resource not accessible by integration', 403) });
     const iminify = fakeIminify({ 'hero.png': 'completed', 'photo.jpg': 'already-optimized', 'logo.webp': 'already-optimized' });
 
@@ -280,6 +404,7 @@ test('with commit off it only reports, and remembers the originals it measured',
 
     await run({ env: env({ commit: 'false' }), event: event(), kit: kit(), makeGitHub: () => github, makeIminify: iminify.make });
 
+    assert.equal(calls.preflights, 0, 'a report-only run needs no write access');
     assert.deepEqual(calls.created, []);
     assert.deepEqual(calls.commits, []);
     assert.ok(calls.comments[0].body.includes('The commit input is off'));

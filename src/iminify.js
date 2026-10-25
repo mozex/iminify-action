@@ -29,8 +29,10 @@ const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * A client for the Iminify API with the waits the API asks for: `rate_limited` is waited out for
- * the seconds in Retry-After, a network failure or a 5xx is tried again a few times, and the
- * daily limit is thrown as DailyLimitError so the caller can stop queueing.
+ * the seconds in Retry-After, a read that hits a network failure or a 5xx is tried again a few
+ * times, and the daily limit is thrown as DailyLimitError so the caller can stop queueing. An
+ * upload is sent again only when the API says nothing was counted (`rate_limited`,
+ * `start_failed`), since a lost answer may belong to an image already queued and counted.
  */
 export function createIminify({
     token,
@@ -42,7 +44,7 @@ export function createIminify({
 }) {
     const origin = new URL(apiUrl).origin;
 
-    async function request(url, { method = 'GET', body, timeout = 60_000, binary = false } = {}) {
+    async function request(url, { method = 'GET', body, timeout = 60_000, binary = false, idempotent = true } = {}) {
         let failures = 0;
         let waits = 0;
 
@@ -61,7 +63,7 @@ export function createIminify({
                     signal: AbortSignal.timeout(timeout),
                 });
             } catch (error) {
-                if (++failures >= 3) {
+                if (!idempotent || ++failures >= 3) {
                     throw new IminifyError(`Iminify could not be reached: ${error.message}`);
                 }
 
@@ -93,7 +95,9 @@ export function createIminify({
                 continue;
             }
 
-            if (response.status >= 500 && ++failures < 3) {
+            const retryable = idempotent ? response.status >= 500 : 'start_failed' === payload.code;
+
+            if (retryable && ++failures < 3) {
                 await sleep(2000 * 2 ** failures);
                 continue;
             }
@@ -112,7 +116,7 @@ export function createIminify({
             form.append('keep_metadata', keepMetadata ? 'true' : 'false');
             form.append('alt_text', 'false');
 
-            return request(`${apiUrl}/images`, { method: 'POST', body: form, timeout: 300_000 });
+            return request(`${apiUrl}/images`, { method: 'POST', body: form, timeout: 300_000, idempotent: false });
         },
 
         async waitFor(id, { interval = 3000, timeout = 900_000 } = {}) {

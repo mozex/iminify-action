@@ -29,19 +29,20 @@ export function sameFormat(path, format) {
 }
 
 /**
- * A pattern the way .gitignore reads one: `*` stays inside a folder, `**` crosses folders, a
- * pattern with no slash matches a name in any folder, and one ending in a slash matches everything
- * under that folder.
+ * A pattern the way .gitignore reads one, without `!` or `[...]`: `*` stays inside a folder, `**`
+ * crosses folders, a pattern with no slash, or only one at its end, matches at any depth, one
+ * with a slash before its end starts at the repository root, and a pattern that names a folder
+ * covers everything under it.
  */
 export function globToRegExp(pattern) {
     let glob = pattern.trim().replace(/^\.\//, '');
 
-    if (glob.endsWith('/')) {
-        glob += '**';
+    if (!glob.replace(/\/$/, '').includes('/')) {
+        glob = `**/${glob}`;
     }
 
-    if (!glob.includes('/')) {
-        glob = `**/${glob}`;
+    if (glob.endsWith('/')) {
+        glob += '**';
     }
 
     glob = glob.replace(/^\//, '');
@@ -65,7 +66,7 @@ export function globToRegExp(pattern) {
         }
     }
 
-    return new RegExp(`^${source}$`);
+    return new RegExp(`^${source}(?:/.*)?$`);
 }
 
 export function parseList(value) {
@@ -77,10 +78,11 @@ export function parseList(value) {
 
 /**
  * The pull request's images still to compress: a format Iminify keeps, not ignored, and bytes the
- * action has not already handled (its own output, or an image it found already optimized).
+ * action has not already handled (its own output, or an image it found already optimized). A
+ * moved or copied file keeps the path it came from, so the caller can tell a move from an edit.
  *
- * @param {Array<{filename: string, status: string, sha: string}>} files GitHub's list of the pull request's files
- * @returns {Array<{path: string, sha: string}>}
+ * @param {Array<{filename: string, status: string, sha: string, previous_filename?: string}>} files GitHub's list of the pull request's files
+ * @returns {Array<{path: string, sha: string, from: ?string}>}
  */
 export function selectFiles(files, { ignore = [], known = new Set() } = {}) {
     const patterns = ignore.map(globToRegExp);
@@ -90,5 +92,51 @@ export function selectFiles(files, { ignore = [], known = new Set() } = {}) {
         .filter((file) => EXTENSIONS.includes(extensionOf(file.filename)))
         .filter((file) => !patterns.some((pattern) => pattern.test(file.filename)))
         .filter((file) => !known.has(file.sha))
-        .map((file) => ({ path: file.filename, sha: file.sha }));
+        .map((file) => ({ path: file.filename, sha: file.sha, from: file.previous_filename ?? null }));
+}
+
+const LFS_POINTER = 'version https://git-lfs.github.com/spec/v1';
+
+/** The format the bytes themselves are in, read from their first bytes. */
+export function detectFormat(bytes) {
+    const ascii = (start, end) => bytes.subarray(start, end).toString('latin1');
+
+    if ('89504e470d0a1a0a' === bytes.subarray(0, 8).toString('hex')) {
+        return 'png';
+    }
+
+    if ('ffd8ff' === bytes.subarray(0, 3).toString('hex')) {
+        return 'jpg';
+    }
+
+    if (['GIF87a', 'GIF89a'].includes(ascii(0, 6))) {
+        return 'gif';
+    }
+
+    if ('RIFF' === ascii(0, 4) && 'WEBP' === ascii(8, 12)) {
+        return 'webp';
+    }
+
+    return null;
+}
+
+/**
+ * Why a file can't be sent as it is, or null. Iminify reads a file by its bytes, so a PNG named
+ * .jpg would come back under the wrong extension, and a Git LFS pointer is a few lines of text.
+ * Neither changes until the file does, so the caller remembers them instead of paying again.
+ */
+export function contentProblem(path, bytes) {
+    if (LFS_POINTER === bytes.subarray(0, LFS_POINTER.length).toString('latin1')) {
+        return 'It is stored in Git LFS, and the action reads only files kept in Git itself.';
+    }
+
+    const format = detectFormat(bytes);
+
+    if (!sameFormat(path, format)) {
+        return format
+            ? `Its bytes are a ${format.toUpperCase()}, not what its .${extensionOf(path)} extension says.`
+            : `Its bytes are not a ${extensionOf(path).toUpperCase()} image.`;
+    }
+
+    return null;
 }

@@ -6,6 +6,8 @@ export class GitHubError extends Error {
     }
 }
 
+const encodePath = (path) => path.split('/').map(encodeURIComponent).join('/');
+
 /** The handful of REST calls the action makes, on the token the workflow hands it. */
 export function createGitHub({
     token,
@@ -66,6 +68,29 @@ export function createGitHub({
         /** GitHub lists at most 250 commits of a pull request. */
         pullCommits: (number) => paginate(`/pulls/${number}/commits`, 250),
 
+        /** The commit GitHub compares a pull request against: where its branch left the base. */
+        mergeBase: async (base, head) => (await request(`/compare/${base}...${head}`)).merge_base_commit.sha,
+
+        /**
+         * Each file's blob in one folder at a commit, by path, from one listing that carries no
+         * file's bytes; empty where the folder didn't exist. GitHub lists up to 1,000 entries.
+         *
+         * @returns {Promise<Map<string, string>>}
+         */
+        async folderShas(folder, ref) {
+            try {
+                const entries = await request(`/contents/${encodePath(folder)}?ref=${ref}`);
+
+                return new Map(entries.filter((entry) => 'file' === entry.type).map((entry) => [entry.path, entry.sha]));
+            } catch (error) {
+                if (404 === error.status) {
+                    return new Map();
+                }
+
+                throw error;
+            }
+        },
+
         /** The Git database's blob endpoint, because the contents endpoint stops at 1 MB. */
         blob: (sha) => request(`/git/blobs/${sha}`, { accept: 'application/vnd.github.raw+json', raw: true }),
 
@@ -77,8 +102,8 @@ export function createGitHub({
 
         /**
          * One commit on top of `parent` pointing each path at its new blob, then a fast-forward of
-         * the branch. Made through the API, so GitHub signs it, and with the workflow's token, so
-         * it starts no new workflow run. A branch that moved since `parent` refuses the update (422).
+         * the branch. Made with the workflow's token, it starts no new workflow run. A branch that
+         * moved since `parent` refuses the update (422).
          *
          * @param {{branch: string, parent: string, message: string, entries: Array<{path: string, sha: string}>}} commit
          * @returns {Promise<string>} the new commit's sha
@@ -97,7 +122,7 @@ export function createGitHub({
                 body: { message, tree: tree.sha, parents: [parent] },
             });
 
-            await request(`/git/refs/heads/${branch.split('/').map(encodeURIComponent).join('/')}`, {
+            await request(`/git/refs/heads/${encodePath(branch)}`, {
                 method: 'PATCH',
                 body: { sha: commit.sha, force: false },
             });

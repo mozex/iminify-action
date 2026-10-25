@@ -83,6 +83,25 @@ test('a server error or a network failure is tried again, a refusal is not', asy
     assert.equal(refused.calls.length, 1);
 });
 
+test('an upload goes again only when nothing was counted', async () => {
+    const started = client([
+        () => json(503, { message: 'The Compression could not be started, please try again', code: 'start_failed' }),
+        () => json(202, { data: { id: 'img-1' } }),
+    ]);
+
+    assert.equal((await started.iminify.upload({ bytes: Buffer.from('x'), name: 'a.png', level: 'smart' })).id, 'img-1');
+    assert.equal(started.calls.length, 2);
+
+    for (const answer of [() => json(500, null), () => json(502, null), () => {
+        throw new TypeError('fetch failed');
+    }]) {
+        const lost = client([answer, () => json(202, { data: { id: 'img-2' } })]);
+
+        await assert.rejects(lost.iminify.upload({ bytes: Buffer.from('x'), name: 'a.png', level: 'smart' }), IminifyError);
+        assert.equal(lost.calls.length, 1, 'the image may already be queued and counted');
+    }
+});
+
 test('a wrong token or an unverified account is fatal', async () => {
     for (const [status, code] of [[401, 'unauthenticated'], [403, 'email_not_verified'], [403, 'account_banned']]) {
         const { iminify } = client([() => json(status, { message: 'No.', code })]);

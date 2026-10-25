@@ -38,6 +38,11 @@ const percent = (saved, total) => (total > 0 ? `${((saved / total) * 100).toFixe
 
 const plural = (count, one, many) => `${count} ${1 === count ? one : many}`;
 
+/** How many entries a list or the table shows, so a huge run's comment stays under GitHub's 65,536 characters. */
+const SHOWN = 100;
+
+const more = (list) => (list.length > SHOWN ? [`...and ${list.length - SHOWN} more.`] : []);
+
 /** A path as inline code that also survives a table cell. */
 const code = (path) => `\`${path.replace(/\|/g, '\\|')}\``;
 
@@ -51,7 +56,7 @@ export function commitMessage(compressed) {
 /**
  * What the run did, in Markdown, for the pull request comment and the job summary.
  *
- * @param {{compressed: Array, optimized: Array, failed: Array, leftOver: Array, limitMessage: ?string, commit: ?string, commitNote: ?string, committing: boolean}} result
+ * @param {{sent: number, compressed: Array, optimized: Array, skipped: Array, failed: Array, leftOver: Array, limitMessage: ?string, commit: ?string, commitNote: ?string}} result
  */
 export function report(result) {
     const lines = [];
@@ -69,25 +74,35 @@ export function report(result) {
 
         lines.push(headline, '', '| Image | Before | After | Saved |', '| --- | ---: | ---: | ---: |');
 
-        for (const file of result.compressed) {
+        for (const file of result.compressed.slice(0, SHOWN)) {
             lines.push(`| ${code(file.path)} | ${formatBytes(file.before)} | ${formatBytes(file.after)} | ${percent(file.before - file.after, file.before)} |`);
         }
-    } else {
+
+        if (result.compressed.length > SHOWN) {
+            lines.push('', ...more(result.compressed));
+        }
+    } else if (result.sent) {
         lines.push('**Iminify found nothing it could make smaller.**');
+    } else {
+        lines.push('**Nothing was sent to Iminify.**');
     }
 
     if (result.optimized.length) {
-        lines.push('', `Already as small as Iminify can make them: ${result.optimized.map((file) => code(file.path)).join(', ')}.`);
+        lines.push('', `Already as small as Iminify can make them: ${result.optimized.slice(0, SHOWN).map((file) => code(file.path)).join(', ')}.`, ...more(result.optimized));
+    }
+
+    if (result.skipped.length) {
+        lines.push('', 'Left alone:', ...result.skipped.slice(0, SHOWN).map((file) => `- ${code(file.path)}: ${file.message}`), ...more(result.skipped));
     }
 
     if (result.failed.length) {
-        lines.push('', 'Not compressed:', ...result.failed.map((file) => `- ${code(file.path)}: ${file.message}`));
+        lines.push('', 'Not compressed, and sent again on the next push:', ...result.failed.slice(0, SHOWN).map((file) => `- ${code(file.path)}: ${file.message}`), ...more(result.failed));
     }
 
     if (result.leftOver.length) {
         lines.push(
             '',
-            `The account's images for today ran out before ${plural(result.leftOver.length, 'image', 'images')} (${result.leftOver.map(code).join(', ')}). The next push to this pull request sends them again.`,
+            `The account's images for today ran out before ${plural(result.leftOver.length, 'image', 'images')} (${result.leftOver.slice(0, SHOWN).map(code).join(', ')}${result.leftOver.length > SHOWN ? ' and more' : ''}). The next push to this pull request sends them again.`,
         );
 
         if (result.limitMessage) {

@@ -56,6 +56,29 @@ test('a commit goes on top of the parent and fast-forwards the branch without fo
     assert.deepEqual(JSON.parse(calls[4].body), { sha: 'new-commit', force: false });
 });
 
+test('the merge base comes from the comparison, and a folder lists each file\'s blob without its bytes', async () => {
+    const { github, calls } = client([
+        () => json(200, { merge_base_commit: { sha: 'mb' }, files: [] }),
+        () => json(200, [
+            { type: 'file', path: 'a b/c#.png', sha: 's1' },
+            { type: 'dir', path: 'a b/sub', sha: 's2' },
+        ]),
+        () => json(404, { message: 'Not Found' }),
+        () => json(502, { message: 'Server Error' }),
+    ]);
+
+    assert.equal(await github.mergeBase('base', 'head'), 'mb');
+    assert.deepEqual([...await github.folderShas('a b', 'mb')], [['a b/c#.png', 's1']]);
+    assert.deepEqual([...await github.folderShas('gone', 'mb')], [], 'a folder missing at that commit holds nothing');
+    await assert.rejects(github.folderShas('x', 'mb'), (error) => error instanceof GitHubError && 502 === error.status);
+    assert.deepEqual(calls.map((call) => call.url), [
+        `${REPO}/compare/base...head`,
+        `${REPO}/contents/a%20b?ref=mb`,
+        `${REPO}/contents/gone?ref=mb`,
+        `${REPO}/contents/x?ref=mb`,
+    ]);
+});
+
 test('a refusal carries GitHub\'s message and status', async () => {
     const { github } = client([() => json(422, { message: 'Update is not a fast forward' })]);
 

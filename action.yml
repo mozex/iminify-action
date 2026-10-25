@@ -25,11 +25,11 @@ inputs:
     required: false
     default: 'true'
   comment:
-    description: Write the savings in a pull request comment, updated on every run.
+    description: Write the savings in a pull request comment, updated on every run. With false, images Iminify couldn't make smaller are sent again on every push.
     required: false
     default: 'true'
   ignore:
-    description: Paths to leave alone, one pattern a line, in .gitignore style (fixtures/, **/*.gif).
+    description: Paths to leave alone, one pattern a line, read like .gitignore patterns without ! or [...] (fixtures, *.gif, docs/**/*.png).
     required: false
     default: ''
 outputs:

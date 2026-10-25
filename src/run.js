@@ -1,7 +1,7 @@
 import { posix } from 'node:path';
-import { createGitHub } from './github.js';
+import { createGitHub, GitHubError } from './github.js';
 import { createIminify, DailyLimitError, IminifyError } from './iminify.js';
-import { blobSha, parseList, sameFormat, selectFiles } from './files.js';
+import { blobSha, contentProblem, parseList, sameFormat, selectFiles } from './files.js';
 import { MARKER, commentBody, commitMessage, knownBlobs, report } from './report.js';
 import { getBooleanInput, getInput } from './toolkit.js';
 
@@ -9,6 +9,12 @@ import { getBooleanInput, getInput } from './toolkit.js';
 const LEVELS = ['smart', 'ultra', 'lossless'];
 
 const DEPENDABOT = 'dependabot[bot]';
+
+/** Only these may have written a comment carrying the marker; anyone can comment on a public pull request. */
+const TRUSTED = ['OWNER', 'MEMBER', 'COLLABORATOR'];
+
+/** A refusal no other file would escape: Iminify's fatal ones, or GitHub refusing the workflow's token. */
+const stopsTheRun = (error) => (error instanceof IminifyError && error.isFatal) || (error instanceof GitHubError && [401, 403].includes(error.status));
 
 export function readInputs(env) {
     const level = getInput('level', env) || 'smart';
@@ -88,8 +94,26 @@ export async function run({ env, event, kit, makeGitHub = createGitHub, makeImin
         github.pullCommits(pull.number),
         github.comments(pull.number),
     ]);
-    const previous = comments.find((comment) => comment.body?.includes(MARKER));
-    const candidates = selectFiles(files, { ignore: inputs.ignore, known: knownBlobs({ comment: previous?.body, commits }) });
+    const previous = comments.find((comment) => comment.body?.includes(MARKER) && ('Bot' === comment.user?.type || TRUSTED.includes(comment.author_association)));
+    const known = knownBlobs({ comment: previous?.body, commits });
+    const selected = selectFiles(files, { ignore: inputs.ignore, known });
+    const moved = selected.filter((file) => null !== file.from);
+    const before = new Map();
+
+    // A file moved or copied unchanged was compressed, or chosen not to be, where it came from.
+    // GitHub lists a pull request's files against the merge base, so that's where they're read,
+    // one folder listing at a time.
+    if (moved.length) {
+        const mergeBase = await github.mergeBase(current.base.sha, current.head.sha);
+
+        for (const folder of new Set(moved.map((file) => posix.dirname(file.from)))) {
+            for (const [path, sha] of await github.folderShas('.' === folder ? '' : folder, mergeBase)) {
+                before.set(path, sha);
+            }
+        }
+    }
+
+    const candidates = selected.filter((file) => null === file.from || before.get(file.from) !== file.sha);
 
     if (!candidates.length) {
         kit.info('No new images to compress in this pull request.');
@@ -98,18 +122,41 @@ export async function run({ env, event, kit, makeGitHub = createGitHub, makeImin
         return null;
     }
 
-    kit.info(`Sending ${candidates.length} ${1 === candidates.length ? 'image' : 'images'} to Iminify.`);
+    // A token that can't write would otherwise surface only after every image was counted.
+    if (inputs.commit) {
+        try {
+            await github.createBlob(Buffer.alloc(0));
+        } catch (error) {
+            if (error instanceof GitHubError && [403, 404].includes(error.status)) {
+                throw new Error(`GitHub refused to store a file (${error.message}). Give the workflow the contents: write permission.`);
+            }
+
+            throw error;
+        }
+    } else if (!inputs.comment) {
+        kit.notice('With commit and comment both off, nothing remembers these images, so every push sends them again.');
+    }
+
+    kit.info(`Checking ${candidates.length} new ${1 === candidates.length ? 'image' : 'images'}.`);
 
     const iminify = makeIminify({ token: inputs.token, userAgent, log: kit.info });
-    const result = { compressed: [], optimized: [], failed: [], leftOver: [], limitMessage: null, commit: null, commitNote: null };
+    const result = { sent: 0, compressed: [], optimized: [], skipped: [], failed: [], leftOver: [], limitMessage: null, commit: null, commitNote: null };
     const queued = [];
 
     for (const [index, file] of candidates.entries()) {
         try {
             const bytes = await github.blob(file.sha);
+            const problem = contentProblem(file.path, bytes);
+
+            if (problem) {
+                result.skipped.push({ path: file.path, message: problem, inputSha: file.sha });
+                continue;
+            }
+
             const image = await iminify.upload({ bytes, name: posix.basename(file.path), level: inputs.level, keepMetadata: inputs.keepMetadata });
 
             queued.push({ ...file, id: image.id });
+            result.sent++;
         } catch (error) {
             if (error instanceof DailyLimitError) {
                 result.leftOver = candidates.slice(index).map((left) => left.path);
@@ -117,7 +164,7 @@ export async function run({ env, event, kit, makeGitHub = createGitHub, makeImin
                 break;
             }
 
-            if (error instanceof IminifyError && error.isFatal) {
+            if (stopsTheRun(error)) {
                 throw error;
             }
 
@@ -133,7 +180,7 @@ export async function run({ env, event, kit, makeGitHub = createGitHub, makeImin
             const smaller = 'completed' === image.status && image.saved_bytes > 0;
 
             if (smaller && !sameFormat(file.path, image.optimized.format)) {
-                result.failed.push({ path: file.path, message: `Iminify returned it as ${image.optimized.format}, so it was left as it is.` });
+                result.skipped.push({ path: file.path, message: `Iminify returned it as ${image.optimized.format}, so it was left as it is.`, inputSha: file.sha });
             } else if (smaller) {
                 const bytes = await iminify.download(image.optimized.download_url);
 
@@ -153,7 +200,7 @@ export async function run({ env, event, kit, makeGitHub = createGitHub, makeImin
                 result.failed.push({ path: file.path, message: 'failed' === image.status ? 'Iminify could not compress it.' : 'It was cancelled on Iminify before it started.' });
             }
         } catch (error) {
-            if (error instanceof IminifyError && error.isFatal) {
+            if (stopsTheRun(error)) {
                 throw error;
             }
 
@@ -179,12 +226,22 @@ export async function run({ env, event, kit, makeGitHub = createGitHub, makeImin
     }
 
     if (inputs.comment) {
-        const known = new Set([
-            ...knownBlobs({ comment: previous?.body }),
-            ...result.optimized.map((file) => file.inputSha),
-            ...result.compressed.map((file) => (inputs.commit ? (result.commit ? file.outputSha : null) : file.inputSha)).filter(Boolean),
+        const remembered = new Set([
+            ...known,
+            ...[...result.optimized, ...result.skipped].map((file) => file.inputSha),
         ]);
-        const body = commentBody(result, known);
+
+        // A compressed image is remembered by the bytes its path now holds: the action's own once
+        // committed, the original with commit off, and neither when the commit failed.
+        for (const file of result.compressed) {
+            if (!inputs.commit) {
+                remembered.add(file.inputSha);
+            } else if (result.commit) {
+                remembered.add(file.outputSha);
+            }
+        }
+
+        const body = commentBody(result, remembered);
 
         try {
             await (previous ? github.updateComment(previous.id, body) : github.createComment(pull.number, body));
@@ -193,7 +250,7 @@ export async function run({ env, event, kit, makeGitHub = createGitHub, makeImin
         }
     }
 
-    for (const file of result.failed) {
+    for (const file of [...result.skipped, ...result.failed]) {
         kit.warning(`${file.path}: ${file.message}`);
     }
 
