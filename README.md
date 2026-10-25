@@ -47,7 +47,7 @@ The action reads the files through GitHub's API, so the job needs no checkout st
 - It looks at the PNG, JPG, WebP and GIF files the pull request adds or changes. A file only moved or copied, with the same bytes, isn't sent again. HEIC and TIFF files are left alone because Iminify always returns them in another format, and a new extension would break every reference to the file.
 - It checks each file's first bytes before sending it. A file whose bytes don't match its extension (a PNG named `.jpg`) is left alone, and so is a file stored in Git LFS: the action reads only what's in Git itself.
 - It sends each one to Iminify with alt text off and its format kept, at the level you choose.
-- Files that came back smaller go into one commit on the pull request's branch. It's made with the workflow's own token, so it doesn't start another workflow run.
+- Files that came back smaller go into one commit on the pull request's branch, made with the workflow's own token and signed by GitHub as `github-actions[bot]`.
 - The comment lists every file with its size before and after. The action updates the same comment on each push instead of adding a new one.
 - A later push sends only what's new. The action's commits name the files they wrote, and its comment remembers the images Iminify couldn't make smaller and the files it left alone. An image that failed is sent again. With `comment: false`, so is an image Iminify couldn't make smaller, since only the comment remembers it, and with `commit` and `comment` both off, every image is sent again on every push.
 
@@ -85,7 +85,7 @@ Don't switch the workflow to `pull_request_target` to get around this. That even
 
 ## Required status checks
 
-A commit made with the workflow's own token doesn't start workflow runs, so required checks on the new head commit wait until the next push. If that gets in the way, pass a personal access token or a GitHub App token as `github-token`. Its commit starts a new run, which doesn't send the files the action just wrote.
+GitHub doesn't run workflows on a commit made with the workflow's own token by itself: it holds those runs until someone with write access approves them on the pull request, so required checks on the action's commit wait for that approval or for the next push. The approved run of this action finds nothing new and sends nothing. To have the checks start on their own, pass a personal access token or a GitHub App token as `github-token`.
 
 ## License
 

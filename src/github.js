@@ -102,8 +102,8 @@ export function createGitHub({
 
         /**
          * One commit on top of `parent` pointing each path at its new blob, then a fast-forward of
-         * the branch. Made with the workflow's token, it starts no new workflow run. A branch that
-         * moved since `parent` refuses the update (422).
+         * the branch. GitHub holds the runs a workflow token's commit would start until someone
+         * approves them. A branch that moved since `parent` refuses the update (422).
          *
          * @param {{branch: string, parent: string, message: string, entries: Array<{path: string, sha: string}>}} commit
          * @returns {Promise<string>} the new commit's sha
