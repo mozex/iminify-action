@@ -1,0 +1,44 @@
+name: Iminify Image Compression
+description: Compress the images a pull request adds with Iminify, commit the smaller files to its branch, and comment with the savings.
+author: Iminify
+branding:
+  icon: image
+  color: blue
+inputs:
+  token:
+    description: An Iminify API token, from Settings > API Tokens on iminify.com. Pass it from a repository secret.
+    required: true
+  github-token:
+    description: The token that reads the pull request, commits to its branch and writes the comment. Needs contents and pull-requests write permission.
+    required: false
+    default: ${{ github.token }}
+  level:
+    description: How hard to compress. smart finds the lowest quality that still looks like the original, ultra goes a little further, lossless changes no pixel.
+    required: false
+    default: smart
+  keep-metadata:
+    description: Keep the EXIF metadata (camera, date, location) in the compressed files.
+    required: false
+    default: 'false'
+  commit:
+    description: Commit the smaller files to the pull request's branch. With false, the action only reports what it would save.
+    required: false
+    default: 'true'
+  comment:
+    description: Write the savings in a pull request comment, updated on every run.
+    required: false
+    default: 'true'
+  ignore:
+    description: Paths to leave alone, one pattern a line, in .gitignore style (fixtures/, **/*.gif).
+    required: false
+    default: ''
+outputs:
+  compressed:
+    description: How many images came back smaller.
+  saved-bytes:
+    description: The bytes those images saved together.
+  commit:
+    description: The commit that carries the smaller files, or empty when there is none.
+runs:
+  using: node24
+  main: src/main.js
